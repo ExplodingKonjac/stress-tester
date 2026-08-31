@@ -70,6 +70,7 @@ pub struct Judge {
     pub checker_args: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct TestReport {
     pub seed: u64,
     pub verdict: Verdict,

@@ -9,7 +9,6 @@ clap = { version = "4", features = ["derive"] }
 colored = "2"
 ctrlc = "3"
 dirs = "5"
-indicatif = "0.17"
 sha2 = "0.10"
 similar = "2"
 which = "6"

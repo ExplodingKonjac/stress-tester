@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
-use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -130,12 +129,6 @@ pub fn run(cli: &Cli) -> Result<i32> {
     let next_seed = AtomicU64::new(cli.start_seed);
     let start = Instant::now();
 
-    let pb = if cli.verbose {
-        None
-    } else {
-        Some(make_progress_bar(cli.max_tests))
-    };
-
     let mut passed: u64 = 0;
     let mut failure: Option<TestReport> = None;
     let mut harness_error: Option<String> = None;
@@ -189,18 +182,10 @@ pub fn run(cli: &Cli) -> Result<i32> {
                 Ok(Ok(rep)) => {
                     if rep.verdict == Verdict::Ac {
                         passed += 1;
-                        if let Some(pb) = &pb {
-                            pb.inc(1);
-                            pb.set_message(format!("{passed} passed"));
-                        } else {
-                            report::print_test_line(&rep);
-                        }
-                    } else {
-                        if failure.is_none() {
-                            failure = Some(rep);
-                        }
-                        stop.store(true, Ordering::SeqCst);
+                    } else if failure.is_none() {
+                        failure = Some(rep.clone());
                     }
+                    report::print_test_line(&rep);
                 }
                 Ok(Err(e)) => {
                     if harness_error.is_none() {
@@ -213,10 +198,6 @@ pub fn run(cli: &Cli) -> Result<i32> {
             }
         }
     });
-
-    if let Some(pb) = &pb {
-        pb.finish_and_clear();
-    }
 
     let interrupted = stop.load(Ordering::SeqCst) && failure.is_none() && harness_error.is_none();
 
@@ -312,24 +293,6 @@ fn build_program(
 fn split_args(s: Option<&str>) -> Vec<String> {
     s.map(|s| s.split_whitespace().map(str::to_owned).collect())
         .unwrap_or_default()
-}
-
-fn make_progress_bar(max_tests: Option<u64>) -> ProgressBar {
-    let pb = match max_tests {
-        Some(n) => ProgressBar::new(n),
-        None => ProgressBar::new_spinner(),
-    };
-    let template = match max_tests {
-        Some(_) => "{spinner:.green} {pos}/{len} tests | {elapsed} | {per_sec} | {msg}",
-        None => "{spinner:.green} {pos} tests | {elapsed} | {per_sec} | {msg}",
-    };
-    pb.set_style(
-        ProgressStyle::with_template(template)
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
-    pb.set_message("0 passed");
-    pb
 }
 
 /// Save the failing test's data into the output directory:

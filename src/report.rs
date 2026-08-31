@@ -81,11 +81,12 @@ fn format_secs(d: Duration) -> String {
     format!("{}s", d.as_secs_f64())
 }
 
+/// Streaming line for one finished test, e.g. `AC on test #42  (3 ms / 5.1 MB)`.
 pub fn print_test_line(report: &TestReport) {
     println!(
-        "#{:<6} {}  {:>8}  {:>9}",
-        report.seed,
+        "{} on test #{:<6} {:>10}  {:>10}",
         verdict_badge(report.verdict),
+        report.seed,
         fmt_duration(report.candidate_time),
         crate::judge::format_memory(report.candidate_memory),
     );
