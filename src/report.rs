@@ -157,12 +157,15 @@ pub fn render_diff(expected: &Path, found: &Path) -> Option<Vec<String>> {
             out.push(format!("         {} more lines...", "...".dimmed()));
             break;
         }
-        let (prefix, text) = match change.tag() {
-            ChangeTag::Equal => (' ', format!("{change}").normal()),
-            ChangeTag::Delete => ('-', format!("{change}").green()),
-            ChangeTag::Insert => ('+', format!("{change}").red()),
+        // Trim before coloring: `ColoredString` derefs to the *uncolored*
+        // input, so trimming after `.green()`/`.red()` would drop the color.
+        let text = format!("{change}").trim_end_matches('\n').to_owned();
+        let (prefix, colored) = match change.tag() {
+            ChangeTag::Equal => (' ', text.normal()),
+            ChangeTag::Delete => ('-', text.green()),
+            ChangeTag::Insert => ('+', text.red()),
         };
-        out.push(format!("         {prefix} {}", text.trim_end_matches('\n')));
+        out.push(format!("         {prefix} {colored}"));
     }
     Some(out)
 }
