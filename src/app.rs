@@ -68,37 +68,26 @@ pub fn run(cli: &Cli) -> Result<i32> {
 
     let checker_kind = match (&checker_prog, &cli.check) {
         (Some(p), _) => crate::judge::Checker::Custom(p.program.clone()),
+        // Unknown names were already rejected by `validate`.
         (None, Some(name)) => {
-            let c = checker::builtin_by_name(name)
-                .ok_or_else(|| anyhow::anyhow!("unknown builtin checker `{name}`"))?;
-            crate::judge::Checker::Builtin(c)
+            crate::judge::Checker::Builtin(checker::builtin_by_name(name).expect("validated"))
         }
-        (None, None) => crate::judge::Checker::Builtin(checker::builtin_by_name("wcmp").unwrap()),
+        (None, None) => crate::judge::Checker::Builtin(checker::BuiltinChecker::Wcmp),
     };
 
-    let secs = |s: f64| Duration::from_secs_f64(s);
-    let mb = |mb: u64| mb * 1024 * 1024;
+    let lim = |t: f64, m: u64| Limits {
+        time: Duration::from_secs_f64(t),
+        memory: m * 1024 * 1024,
+    };
     let judge = Arc::new(Judge {
         candidate: candidate.program.clone(),
         reference: reference.program.clone(),
         generator: generator.program.clone(),
         checker: checker_kind,
-        candidate_limits: Limits {
-            time: secs(cli.time_limit),
-            memory: mb(cli.memory_limit),
-        },
-        reference_limits: Limits {
-            time: secs(cli.ref_time_limit),
-            memory: mb(cli.ref_memory_limit),
-        },
-        generator_limits: Limits {
-            time: secs(cli.gen_time_limit),
-            memory: mb(cli.gen_memory_limit),
-        },
-        checker_limits: Limits {
-            time: secs(cli.checker_time_limit),
-            memory: mb(cli.checker_memory_limit),
-        },
+        candidate_limits: lim(cli.time_limit, cli.memory_limit),
+        reference_limits: lim(cli.ref_time_limit, cli.ref_memory_limit),
+        generator_limits: lim(cli.gen_time_limit, cli.gen_memory_limit),
+        checker_limits: lim(cli.checker_time_limit, cli.checker_memory_limit),
         generator_args: split_args(cli.gen_args.as_deref()),
         checker_args: split_args(cli.checker_args.as_deref()),
     });
@@ -150,18 +139,16 @@ pub fn run(cli: &Cli) -> Result<i32> {
     let mut passed: u64 = 0;
     let mut failure: Option<TestReport> = None;
     let mut harness_error: Option<String> = None;
-    let jobs = cli.jobs;
 
     thread::scope(|s| {
-        let mut handles = Vec::new();
-        for worker_id in 0..jobs {
+        for worker_id in 0..cli.jobs {
             let tx = tx.clone();
             let judge = Arc::clone(&judge);
             let stop = Arc::clone(&stop);
             let next_seed = &next_seed;
             let max_tests = cli.max_tests;
             let workdir = temp_root.join(format!("w{worker_id}"));
-            handles.push(s.spawn(move || {
+            s.spawn(move || {
                 if let Err(e) = std::fs::create_dir_all(&workdir) {
                     let _ = tx.send(Err(format!("failed to create {}: {e}", workdir.display())));
                     return;
@@ -171,10 +158,10 @@ pub fn run(cli: &Cli) -> Result<i32> {
                         break;
                     }
                     let seed = next_seed.fetch_add(1, Ordering::SeqCst);
-                    if let Some(max) = max_tests {
-                        if seed >= cli.start_seed + max {
-                            break;
-                        }
+                    if let Some(max) = max_tests
+                        && seed >= cli.start_seed + max
+                    {
+                        break;
                     }
                     match judge.run_test(seed, &workdir) {
                         Ok(rep) => {
@@ -192,7 +179,7 @@ pub fn run(cli: &Cli) -> Result<i32> {
                         }
                     }
                 }
-            }));
+            });
         }
         drop(tx);
 
@@ -225,9 +212,6 @@ pub fn run(cli: &Cli) -> Result<i32> {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        for h in handles {
-            let _ = h.join();
-        }
     });
 
     if let Some(pb) = &pb {
@@ -258,13 +242,13 @@ fn validate(cli: &Cli) -> Result<()> {
     if cli.checker.is_some() && cli.check.is_some() {
         bail!("--checker and --check are mutually exclusive");
     }
-    if let Some(name) = &cli.check {
-        if checker::builtin_by_name(name).is_none() {
-            bail!(
-                "unknown builtin checker `{name}` (available: {})",
-                checker::BUILTIN_NAMES.join(", ")
-            );
-        }
+    if let Some(name) = &cli.check
+        && checker::builtin_by_name(name).is_none()
+    {
+        bail!(
+            "unknown builtin checker `{name}` (available: {})",
+            checker::BUILTIN_NAMES.join(", ")
+        );
     }
     if cli.checker.is_none() && (cli.checker_args.is_some() || cli.checker_flags.is_some()) {
         bail!("--checker-args/--checker-flags require -k/--checker");
@@ -286,10 +270,10 @@ fn validate(cli: &Cli) -> Result<()> {
     {
         bail!("memory limits must be at least 1 MB");
     }
-    if let Some(n) = cli.max_tests {
-        if n == 0 {
-            bail!("--max-tests must be at least 1");
-        }
+    if let Some(n) = cli.max_tests
+        && n == 0
+    {
+        bail!("--max-tests must be at least 1");
     }
     Ok(())
 }
@@ -308,11 +292,11 @@ fn build_program(
     };
     let result = lang::build(source, &opts)?;
     let note = if !result.language.compiled() {
-        "interpreted".to_owned()
+        "interpreted"
     } else if result.cached {
-        "cached".to_owned()
+        "cached"
     } else {
-        "compiled".to_owned()
+        "compiled"
     };
     println!(
         "  {} {:<10} {:<24} ({}, {})",

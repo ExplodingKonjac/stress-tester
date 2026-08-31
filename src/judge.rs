@@ -125,9 +125,7 @@ impl Judge {
             &gen_err,
             self.generator_limits,
         ) {
-            report.verdict = Verdict::Failed;
-            report.failed_aux = Some(AuxProgram::Generator);
-            report.message = msg;
+            fail_aux(&mut report, AuxProgram::Generator, msg);
             return Ok(report);
         }
 
@@ -186,9 +184,7 @@ impl Judge {
             &ref_err,
             self.reference_limits,
         ) {
-            report.verdict = Verdict::Failed;
-            report.failed_aux = Some(AuxProgram::Reference);
-            report.message = msg;
+            fail_aux(&mut report, AuxProgram::Reference, msg);
             return Ok(report);
         }
 
@@ -204,14 +200,11 @@ impl Judge {
             }
             Checker::Custom(prog) => {
                 let mut argv = prog.argv.clone();
-                argv.extend(
-                    [
-                        report.input.clone().into_os_string(),
-                        report.candidate_output.clone().into_os_string(),
-                        report.reference_output.clone().into_os_string(),
-                    ]
-                    .into_iter(),
-                );
+                argv.extend([
+                    report.input.clone().into_os_string(),
+                    report.candidate_output.clone().into_os_string(),
+                    report.reference_output.clone().into_os_string(),
+                ]);
                 argv.extend(self.checker_args.iter().map(OsString::from));
                 let stats = run(
                     &argv,
@@ -220,25 +213,28 @@ impl Judge {
                     Some(&chk_err),
                     self.checker_limits,
                 )?;
-                let mut fail = |msg: String| {
-                    report.verdict = Verdict::Failed;
-                    report.failed_aux = Some(AuxProgram::Checker);
-                    report.message = msg;
-                };
                 if stats.timed_out {
-                    fail(format!(
-                        "checker timed out: {:.3}s > {:.3}s",
-                        stats.wall_time.as_secs_f64(),
-                        self.checker_limits.time.as_secs_f64()
-                    ));
+                    fail_aux(
+                        &mut report,
+                        AuxProgram::Checker,
+                        format!(
+                            "checker timed out: {:.3}s > {:.3}s",
+                            stats.wall_time.as_secs_f64(),
+                            self.checker_limits.time.as_secs_f64()
+                        ),
+                    );
                     return Ok(report);
                 }
                 if stats.memory_exceeded || stats.peak_memory > self.checker_limits.memory {
-                    fail(format!(
-                        "checker exceeded memory limit: {} > {}",
-                        format_memory(stats.peak_memory),
-                        format_memory(self.checker_limits.memory)
-                    ));
+                    fail_aux(
+                        &mut report,
+                        AuxProgram::Checker,
+                        format!(
+                            "checker exceeded memory limit: {} > {}",
+                            format_memory(stats.peak_memory),
+                            format_memory(self.checker_limits.memory)
+                        ),
+                    );
                     return Ok(report);
                 }
                 match stats.exit {
@@ -255,14 +251,19 @@ impl Judge {
                             };
                         }
                         CustomOutcome::Failed => {
-                            fail(format!(
-                                "checker exited with code {c}{}",
-                                stderr_tail(&chk_err)
-                            ));
+                            fail_aux(
+                                &mut report,
+                                AuxProgram::Checker,
+                                format!("checker exited with code {c}{}", stderr_tail(&chk_err)),
+                            );
                         }
                     },
                     ExitKind::Signal(s) => {
-                        fail(format!("checker killed by {}", signal_name(s)));
+                        fail_aux(
+                            &mut report,
+                            AuxProgram::Checker,
+                            format!("checker killed by {}", signal_name(s)),
+                        );
                     }
                 }
             }
@@ -288,6 +289,13 @@ fn run(
         memory_limit: limits.memory,
     };
     runner::run(&spec).map_err(Into::into)
+}
+
+/// Mark a test as FAILED because an auxiliary (trusted) program misbehaved.
+fn fail_aux(report: &mut TestReport, which: AuxProgram, msg: String) {
+    report.verdict = Verdict::Failed;
+    report.failed_aux = Some(which);
+    report.message = msg;
 }
 
 /// Failure message if an auxiliary (trusted) program misbehaved.

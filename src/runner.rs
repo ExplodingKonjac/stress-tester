@@ -88,13 +88,18 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
         if !timed_out && start.elapsed() >= spec.time_limit {
             timed_out = true;
             unsafe { libc::kill(pid, libc::SIGKILL) };
+        } else if !timed_out
+            && !memory_exceeded
+            && let Some(vm) = vm_hwm_bytes(pid)
+            && vm > spec.memory_limit
+        {
+            peak = peak.max(vm);
+            memory_exceeded = true;
+            unsafe { libc::kill(pid, libc::SIGKILL) };
         } else if !timed_out && !memory_exceeded {
+            // Still within the limit: just record the peak.
             if let Some(vm) = vm_hwm_bytes(pid) {
                 peak = peak.max(vm);
-                if vm > spec.memory_limit {
-                    memory_exceeded = true;
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                }
             }
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -149,13 +154,14 @@ fn ru_maxrss_bytes(ru: &libc::rusage) -> u64 {
 #[cfg(all(unix, target_os = "linux"))]
 fn vm_hwm_bytes(pid: libc::pid_t) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmHWM:") {
-            let kb: u64 = rest.trim_end_matches("kB").trim().parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
+    status
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("VmHWM:")
+                .map(|v| v.trim_end_matches("kB").trim())
+        })
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -229,16 +235,12 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
     let h_stderr = open_file(spec.stderr_file, true)?;
 
     // Build the quoted command line.
-    let mut cmdline = String::new();
-    for (i, arg) in spec.argv.iter().enumerate() {
-        if i > 0 {
-            cmdline.push(' ');
-        }
-        let s = arg.to_string_lossy().replace('"', "\\\"");
-        cmdline.push('"');
-        cmdline.push_str(&s);
-        cmdline.push('"');
-    }
+    let cmdline = spec
+        .argv
+        .iter()
+        .map(|a| format!("\"{}\"", a.to_string_lossy().replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut cmdline_wide = to_wide(cmdline.as_ref());
 
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };

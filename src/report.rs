@@ -108,16 +108,16 @@ pub fn print_failure(report: &TestReport, limits: &Limits, artifact_dir: Option<
     if !report.message.is_empty() {
         println!("         {}", report.message);
     }
-    if report.verdict == Verdict::Wa {
-        if let Some(diff) = render_diff(&report.reference_output, &report.candidate_output) {
-            println!(
-                "         diff ({} = expected, {} = found):",
-                "-".green(),
-                "+".red()
-            );
-            for line in diff {
-                println!("{line}");
-            }
+    if report.verdict == Verdict::Wa
+        && let Some(diff) = render_diff(&report.reference_output, &report.candidate_output)
+    {
+        println!(
+            "         diff ({} = expected, {} = found):",
+            "-".green(),
+            "+".red()
+        );
+        for line in diff {
+            println!("{line}");
         }
     }
     if let Some(dir) = artifact_dir {
@@ -157,11 +157,7 @@ pub fn render_diff(expected: &Path, found: &Path) -> Option<Vec<String>> {
             ChangeTag::Delete => ('-', format!("{change}").green()),
             ChangeTag::Insert => ('+', format!("{change}").red()),
         };
-        let mut line = format!("         {prefix} {text}");
-        if !line.ends_with('\n') {
-            line.push('\n');
-        }
-        out.push(line.trim_end_matches('\n').to_owned());
+        out.push(format!("         {prefix} {}", text.trim_end_matches('\n')));
     }
     Some(out)
 }
