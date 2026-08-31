@@ -1,0 +1,350 @@
+//! Process execution with time/memory limits and resource measurement.
+//!
+//! All stdio is redirected to files, so there are no pipes to deadlock on.
+//! Unix: `wait4(WNOHANG)` polling gives per-child `ru_maxrss`.
+//! Windows: the child runs inside a Job Object; peak memory is queried after exit.
+
+use std::ffi::OsString;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
+
+/// How a program ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitKind {
+    Code(i32),
+    /// Only produced on Unix; Windows has no equivalent.
+    #[cfg_attr(windows, allow(dead_code))]
+    Signal(i32),
+}
+
+/// What to run and under which limits.
+pub struct RunSpec<'a> {
+    pub argv: &'a [OsString],
+    pub stdin_file: Option<&'a Path>,
+    pub stdout_file: Option<&'a Path>,
+    pub stderr_file: Option<&'a Path>,
+    pub time_limit: Duration,
+    /// Bytes; `u64::MAX` disables the check.
+    pub memory_limit: u64,
+}
+
+/// Measured outcome of one run.
+pub struct RunStats {
+    pub timed_out: bool,
+    pub memory_exceeded: bool,
+    pub wall_time: Duration,
+    /// Peak RSS in bytes (best effort).
+    pub peak_memory: u64,
+    pub exit: ExitKind,
+}
+
+// ---------------------------------------------------------------------------
+// Unix backend
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+const POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+#[cfg(unix)]
+pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = Command::new(&spec.argv[0]);
+    cmd.args(&spec.argv[1..]);
+    // Own process group: a terminal Ctrl-C hits stress-tester only, so judged
+    // programs are not killed mid-run (we enforce limits ourselves).
+    cmd.process_group(0);
+    cmd.stdin(open_or_null(spec.stdin_file, false)?);
+    cmd.stdout(open_or_null(spec.stdout_file, true)?);
+    cmd.stderr(open_or_null(spec.stderr_file, true)?);
+
+    // Note: dropping `child` does not kill or reap it; we reap via wait4.
+    let child = cmd.spawn()?;
+    let pid = child.id() as libc::pid_t;
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    let mut memory_exceeded = false;
+    let mut peak = 0u64;
+    let exit;
+
+    loop {
+        let mut status: libc::c_int = 0;
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };
+        if r < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if r == pid {
+            peak = peak.max(ru_maxrss_bytes(&ru));
+            exit = decode_status(status);
+            break;
+        }
+        if !timed_out && start.elapsed() >= spec.time_limit {
+            timed_out = true;
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        } else if !timed_out && !memory_exceeded {
+            if let Some(vm) = vm_hwm_bytes(pid) {
+                peak = peak.max(vm);
+                if vm > spec.memory_limit {
+                    memory_exceeded = true;
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    Ok(RunStats {
+        timed_out,
+        memory_exceeded,
+        wall_time: start.elapsed(),
+        peak_memory: peak,
+        exit,
+    })
+}
+
+#[cfg(unix)]
+fn open_or_null(path: Option<&Path>, write: bool) -> std::io::Result<Stdio> {
+    match path {
+        Some(p) => {
+            if write {
+                Ok(Stdio::from(File::create(p)?))
+            } else {
+                Ok(Stdio::from(File::open(p)?))
+            }
+        }
+        None => Ok(Stdio::null()),
+    }
+}
+
+#[cfg(unix)]
+fn decode_status(status: libc::c_int) -> ExitKind {
+    if libc::WIFEXITED(status) {
+        ExitKind::Code(libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        ExitKind::Signal(libc::WTERMSIG(status))
+    } else {
+        ExitKind::Code(-1)
+    }
+}
+
+/// `ru_maxrss` is KB on Linux and bytes on macOS.
+#[cfg(all(unix, target_os = "linux"))]
+fn ru_maxrss_bytes(ru: &libc::rusage) -> u64 {
+    ru.ru_maxrss.max(0) as u64 * 1024
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ru_maxrss_bytes(ru: &libc::rusage) -> u64 {
+    ru.ru_maxrss.max(0) as u64
+}
+
+/// Live peak-RSS poll for an early memory-limit kill (Linux only).
+#[cfg(all(unix, target_os = "linux"))]
+fn vm_hwm_bytes(pid: libc::pid_t) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmHWM:") {
+            let kb: u64 = rest.trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn vm_hwm_bytes(_pid: libc::pid_t) -> Option<u64> {
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Windows backend (Job Object)
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, PROCESS_INFORMATION, ResumeThread,
+        STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    };
+
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    const CREATE_ALWAYS: u32 = 2;
+
+    fn to_wide(s: &std::ffi::OsStr) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let sa = unsafe {
+        let mut sa = std::mem::zeroed::<SECURITY_ATTRIBUTES>();
+        sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+        sa.bInheritHandle = 1; // BOOL
+        sa
+    };
+
+    let open_file = |path: Option<&Path>, write: bool| -> std::io::Result<*mut core::ffi::c_void> {
+        let (name, access, disposition) = match (path, write) {
+            (Some(p), false) => (to_wide(p.as_os_str()), GENERIC_READ, OPEN_EXISTING),
+            (Some(p), true) => (to_wide(p.as_os_str()), GENERIC_WRITE, CREATE_ALWAYS),
+            (None, _) => (to_wide("NUL".as_ref()), GENERIC_READ, OPEN_EXISTING),
+        };
+        let h = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                &sa,
+                disposition,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(h)
+    };
+
+    let h_stdin = open_file(spec.stdin_file, false)?;
+    let h_stdout = open_file(spec.stdout_file, true)?;
+    let h_stderr = open_file(spec.stderr_file, true)?;
+
+    // Build the quoted command line.
+    let mut cmdline = String::new();
+    for (i, arg) in spec.argv.iter().enumerate() {
+        if i > 0 {
+            cmdline.push(' ');
+        }
+        let s = arg.to_string_lossy().replace('"', "\\\"");
+        cmdline.push('"');
+        cmdline.push_str(&s);
+        cmdline.push('"');
+    }
+    let mut cmdline_wide = to_wide(cmdline.as_ref());
+
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() || job == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = h_stdin;
+    si.hStdOutput = h_stdout;
+    si.hStdError = h_stderr;
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+    let created = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmdline_wide.as_mut_ptr(),
+            &sa,
+            &sa,
+            1, // inherit handles
+            CREATE_SUSPENDED,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si,
+            &mut pi,
+        )
+    };
+
+    let result = (|| -> std::io::Result<RunStats> {
+        if created == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        unsafe {
+            // Parent-side stdio handles are no longer needed.
+            CloseHandle(h_stdin);
+            CloseHandle(h_stdout);
+            CloseHandle(h_stderr);
+
+            AssignProcessToJobObject(job, pi.hProcess);
+            ResumeThread(pi.hThread);
+        }
+
+        let start = Instant::now();
+        let mut timed_out = false;
+        loop {
+            let remaining = spec
+                .time_limit
+                .saturating_sub(start.elapsed())
+                .as_millis()
+                .clamp(1, u32::MAX as u128) as u32;
+            let wait = unsafe { WaitForSingleObject(pi.hProcess, remaining) };
+            if wait == WAIT_OBJECT_0 {
+                break;
+            }
+            if wait == WAIT_TIMEOUT && start.elapsed() >= spec.time_limit {
+                timed_out = true;
+                unsafe {
+                    TerminateProcess(pi.hProcess, 1);
+                    WaitForSingleObject(pi.hProcess, u32::MAX);
+                }
+                break;
+            }
+        }
+
+        let mut exit_code: u32 = 0;
+        unsafe { GetExitCodeProcess(pi.hProcess, &mut exit_code) };
+
+        let mut peak = 0u64;
+        unsafe {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            let ok = QueryInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            );
+            if ok != 0 {
+                peak = info.PeakJobMemoryUsed as u64;
+            }
+        }
+
+        Ok(RunStats {
+            timed_out,
+            memory_exceeded: peak > spec.memory_limit,
+            wall_time: start.elapsed(),
+            peak_memory: peak,
+            exit: ExitKind::Code(exit_code as i32),
+        })
+    })();
+
+    unsafe {
+        if created != 0 {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        CloseHandle(job);
+    }
+    if created == 0 {
+        unsafe {
+            CloseHandle(h_stdin);
+            CloseHandle(h_stdout);
+            CloseHandle(h_stderr);
+        }
+    }
+    result
+}
