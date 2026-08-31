@@ -33,6 +33,7 @@ pub fn run(cli: &Cli) -> Result<i32> {
     };
 
     // Build all programs (serially, so the cache is race-free).
+    println!("{}", "Building programs".bold());
     let candidate = build_program(
         "candidate",
         &cli.candidate,

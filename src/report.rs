@@ -48,7 +48,7 @@ pub struct Banner<'a> {
 }
 
 pub fn print_banner(b: &Banner) {
-    println!("{}", "stress-tester".bold());
+    println!("{}", "Test Information".bold());
     println!(
         "  {:<10} {} ({})",
         "candidate:", b.candidate, b.candidate_lang
@@ -63,16 +63,20 @@ pub fn print_banner(b: &Banner) {
     );
     println!("  {:<10} {}", "checker:", b.checker);
     println!(
-        "  {:<10} TL {} / ML {} | jobs {} | seed {} +{}",
+        "  {:<10} TL {} / ML {}",
         "limits:",
         format_secs(b.limits.time),
         crate::judge::format_memory(b.limits.memory),
+    );
+    println!(
+        "  {:<10} {} jobs, {} tests, initial seed = {}",
+        "metadata:",
         b.jobs,
-        b.start_seed,
         match b.max_tests {
-            Some(n) => format!("{n} tests"),
+            Some(n) => n.to_string(),
             None => "∞".to_owned(),
-        }
+        },
+        b.start_seed,
     );
     println!();
 }
