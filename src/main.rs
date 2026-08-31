@@ -45,6 +45,10 @@ struct Cli {
     #[arg(short = 'n', long)]
     max_tests: Option<u64>,
 
+    /// Directory to save the failing test's data (data.in, data.out, data.ans, checker.log)
+    #[arg(short = 'o', long, default_value = "stress-output")]
+    output: std::path::PathBuf,
+
     /// Number of parallel judging workers
     #[arg(short = 'j', long, default_value_t = 1)]
     jobs: usize,

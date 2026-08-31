@@ -226,7 +226,7 @@ pub fn run(cli: &Cli) -> Result<i32> {
     }
 
     if let Some(rep) = &failure {
-        let artifact_dir = save_artifacts(rep)?;
+        let artifact_dir = save_artifacts(rep, &cli.output)?;
         report::print_failure(rep, &judge.candidate_limits, artifact_dir.as_deref());
         return Ok(match rep.verdict {
             Verdict::Failed => 2,
@@ -332,38 +332,23 @@ fn make_progress_bar(max_tests: Option<u64>) -> ProgressBar {
     pb
 }
 
-/// Copy the failing test's files into ./stress-failure/test-<seed>/.
-fn save_artifacts(rep: &TestReport) -> Result<Option<PathBuf>> {
-    let dir = PathBuf::from("stress-failure").join(format!("test-{}", rep.seed));
+/// Save the failing test's data into the output directory:
+/// `<output>/data.in|data.out|data.ans|checker.log`.
+fn save_artifacts(rep: &TestReport, output: &Path) -> Result<Option<PathBuf>> {
+    let dir = output.to_path_buf();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("{} could not save artifacts: {e}", "warning:".yellow());
         return Ok(None);
     }
     let copy_in = |from: &Path, to: &str| {
-        let _ = std::fs::copy(from, dir.join(to));
+        if from.exists() {
+            let _ = std::fs::copy(from, dir.join(to));
+        }
     };
-    copy_in(&rep.input, "input.txt");
-    copy_in(&rep.candidate_output, "candidate-output.txt");
-    copy_in(&rep.candidate_stderr, "candidate-stderr.txt");
-    copy_in(&rep.reference_output, "reference-output.txt");
-
-    let text = format!(
-        "stress-tester failure report\n\
-         seed: {}\n\
-         verdict: {:?}{}\n\
-         candidate time: {}\n\
-         candidate memory: {}\n\
-         message: {}\n",
-        rep.seed,
-        rep.verdict,
-        rep.failed_aux
-            .map(|p| format!(" ({} failed)", p.name()))
-            .unwrap_or_default(),
-        report::fmt_duration(rep.candidate_time),
-        crate::judge::format_memory(rep.candidate_memory),
-        rep.message,
-    );
-    let _ = std::fs::write(dir.join("report.txt"), text);
+    copy_in(&rep.input, "data.in");
+    copy_in(&rep.candidate_output, "data.out");
+    copy_in(&rep.reference_output, "data.ans");
+    copy_in(&rep.checker_log, "checker.log");
     Ok(Some(dir))
 }
 

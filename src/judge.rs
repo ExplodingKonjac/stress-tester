@@ -81,6 +81,8 @@ pub struct TestReport {
     pub candidate_output: PathBuf,
     pub candidate_stderr: PathBuf,
     pub reference_output: PathBuf,
+    /// Checker verdict log (builtin message or custom checker's output).
+    pub checker_log: PathBuf,
 }
 
 impl TestReport {
@@ -96,7 +98,28 @@ impl TestReport {
             candidate_output: workdir.join("candidate-output.txt"),
             candidate_stderr: workdir.join("candidate-stderr.txt"),
             reference_output: workdir.join("reference-output.txt"),
+            checker_log: workdir.join("checker.log"),
         }
+    }
+}
+
+/// Per-test scratch files inside a worker's workdir.
+const WORKDIR_FILES: &[&str] = &[
+    "input.txt",
+    "candidate-output.txt",
+    "candidate-stderr.txt",
+    "reference-output.txt",
+    "generator-stderr.txt",
+    "reference-stderr.txt",
+    "checker-stdout.txt",
+    "checker-stderr.txt",
+    "checker.log",
+];
+
+/// Successful tests leave nothing behind.
+fn clean_workdir(workdir: &Path) {
+    for name in WORKDIR_FILES {
+        let _ = std::fs::remove_file(workdir.join(name));
     }
 }
 
@@ -195,7 +218,8 @@ impl Judge {
                 let answer = read_for_check(&report.reference_output);
                 if let Some(msg) = c.check(&output, &answer) {
                     report.verdict = Verdict::Wa;
-                    report.message = msg;
+                    report.message.clone_from(&msg);
+                    let _ = std::fs::write(&report.checker_log, msg);
                 }
             }
             Checker::Custom(prog) => {
@@ -213,6 +237,10 @@ impl Judge {
                     Some(&chk_err),
                     self.checker_limits,
                 )?;
+                // checker.log = custom checker's stdout + stderr.
+                let log = std::fs::read_to_string(&chk_out).unwrap_or_default();
+                let log_err = std::fs::read_to_string(&chk_err).unwrap_or_default();
+                let _ = std::fs::write(&report.checker_log, format!("{log}{log_err}"));
                 if stats.timed_out {
                     fail_aux(
                         &mut report,
@@ -269,6 +297,10 @@ impl Judge {
             }
         }
 
+        // Successful tests leave nothing behind.
+        if report.verdict == Verdict::Ac {
+            clean_workdir(workdir);
+        }
         Ok(report)
     }
 }
