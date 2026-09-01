@@ -11,10 +11,10 @@ pub enum BuiltinChecker {
     Rcmp4,
     Rcmp6,
     Rcmp9,
-    YesNo,
+    Nyesno,
 }
 
-pub const BUILTIN_NAMES: &[&str] = &["wcmp", "lcmp", "ncmp", "rcmp4", "rcmp6", "rcmp9", "yesno"];
+pub const BUILTIN_NAMES: &[&str] = &["wcmp", "lcmp", "ncmp", "rcmp4", "rcmp6", "rcmp9", "nyesno"];
 
 pub fn builtin_by_name(name: &str) -> Option<BuiltinChecker> {
     match name {
@@ -24,7 +24,7 @@ pub fn builtin_by_name(name: &str) -> Option<BuiltinChecker> {
         "rcmp4" => Some(BuiltinChecker::Rcmp4),
         "rcmp6" => Some(BuiltinChecker::Rcmp6),
         "rcmp9" => Some(BuiltinChecker::Rcmp9),
-        "yesno" => Some(BuiltinChecker::YesNo),
+        "nyesno" => Some(BuiltinChecker::Nyesno),
         _ => None,
     }
 }
@@ -38,7 +38,7 @@ impl BuiltinChecker {
             BuiltinChecker::Rcmp4 => "rcmp4",
             BuiltinChecker::Rcmp6 => "rcmp6",
             BuiltinChecker::Rcmp9 => "rcmp9",
-            BuiltinChecker::YesNo => "yesno",
+            BuiltinChecker::Nyesno => "nyesno",
         }
     }
 
@@ -52,7 +52,7 @@ impl BuiltinChecker {
             BuiltinChecker::Rcmp4 => rcmp(output, answer, 1e-4),
             BuiltinChecker::Rcmp6 => rcmp(output, answer, 1e-6),
             BuiltinChecker::Rcmp9 => rcmp(output, answer, 1e-9),
-            BuiltinChecker::YesNo => yesno(output, answer),
+            BuiltinChecker::Nyesno => nyesno(output, answer),
         }
     }
 }
@@ -175,34 +175,40 @@ fn rcmp(output: &str, answer: &str, eps: f64) -> Option<String> {
     None
 }
 
-/// Case-insensitive yes/no comparison of the first token.
-fn yesno(output: &str, answer: &str) -> Option<String> {
-    let get = |s: &str, who: &str| -> Result<String, String> {
-        match s.split_whitespace().next() {
-            Some(t) => {
-                let t = t.to_ascii_lowercase();
-                if t == "yes" || t == "no" {
-                    Ok(t)
-                } else {
-                    Err(format!("{who} is not yes/no: {t:?}"))
-                }
-            }
-            None => Err(format!("{who} is empty")),
+/// Sequence of case-insensitive YES/NO tokens, compared pairwise
+/// (testlib's `nyesno`). Extra tokens on either side are rejected;
+/// empty sequences match.
+fn nyesno(output: &str, answer: &str) -> Option<String> {
+    let toks = |s: &str| -> Vec<String> {
+        s.split_whitespace()
+            .map(|t| t.to_ascii_uppercase())
+            .collect()
+    };
+    let a = toks(output);
+    let b = toks(answer);
+
+    for (i, t) in b.iter().enumerate() {
+        if t != "YES" && t != "NO" {
+            return Some(format!(
+                "invalid answer (bug in reference?): token {} is not YES/NO: {t:?}",
+                i + 1
+            ));
         }
-    };
-    let a = match get(output, "output") {
-        Ok(v) => v,
-        Err(e) => return Some(e),
-    };
-    let b = match get(answer, "answer") {
-        Ok(v) => v,
-        Err(e) => return Some(format!("invalid answer (bug in reference?): {e}")),
-    };
-    if a == b {
-        None
-    } else {
-        Some(format!("expected {b}, found {a}"))
     }
+    for (i, t) in a.iter().enumerate() {
+        if t != "YES" && t != "NO" {
+            return Some(format!("token {} is not YES/NO: {t:?}", i + 1));
+        }
+    }
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        if x != y {
+            return Some(format!("token {} differs: expected {y}, found {x}", i + 1));
+        }
+    }
+    if a.len() != b.len() {
+        return Some(format!("expected {} token(s), found {}", b.len(), a.len()));
+    }
+    None
 }
 
 /// Outcome of a custom testlib checker's exit code.
@@ -265,11 +271,21 @@ mod tests {
     }
 
     #[test]
-    fn yesno_basic() {
-        assert_eq!(yesno("YES\n", "yes"), None);
-        assert_eq!(yesno("No", "no"), None);
-        assert!(yesno("yes", "no").is_some());
-        assert!(yesno("maybe", "yes").is_some());
+    fn nyesno_basic() {
+        // Single token, case-insensitive.
+        assert_eq!(nyesno("YES\n", "yes"), None);
+        assert_eq!(nyesno("No", "no"), None);
+        // Sequence of tokens.
+        assert_eq!(nyesno("yes no YES", "YES NO yes"), None);
+        // Mismatch in a later token.
+        assert!(nyesno("yes no", "yes yes").is_some());
+        // Length mismatch either way.
+        assert!(nyesno("yes", "yes no").is_some());
+        assert!(nyesno("yes no", "yes").is_some());
+        // Invalid output token.
+        assert!(nyesno("maybe", "yes").is_some());
+        // Empty sequences match (testlib: "Empty output").
+        assert_eq!(nyesno("", " \n"), None);
     }
 
     #[test]

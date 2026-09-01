@@ -29,7 +29,7 @@ struct Cli {
     #[arg(short = 'k', long)]
     checker: Option<std::path::PathBuf>,
 
-    /// Builtin checker name: wcmp, lcmp, ncmp, rcmp4, rcmp6, rcmp9, yesno
+    /// Builtin checker name: wcmp, lcmp, ncmp, rcmp4, rcmp6, rcmp9, nyesno
     #[arg(long)]
     check: Option<String>,
 
