@@ -27,7 +27,7 @@ WA on test #3            3 ms      2.1 MB
 
 WA on test #3
          time: 3 ms (limit 1s)   memory: 2.1 MB (limit 512.0 MB)
-         token 0 differs: expected "20", found "18"
+         token 1 differs: expected "20", found "18"
          diff (- = expected, + = found):
          - 20
          + 18
@@ -117,10 +117,15 @@ builtin, all reimplementations of the corresponding testlib checker:
 | Name | Comparison |
 |---|---|
 | `wcmp` | tokens, exact (whitespace-insensitive) — default |
-| `lcmp` | lines, ignoring trailing whitespace and trailing blank lines |
-| `ncmp` | sequence of integers |
-| `rcmp4` / `rcmp6` / `rcmp9` | sequence of reals, tolerance 1e-4 / 1e-6 / 1e-9 |
+| `lcmp` | lines, each compared as a sequence of tokens (so spacing *inside* a line is insignificant), ignoring trailing blank lines |
+| `ncmp` | sequence of 64-bit integers, in testlib's strict format: no `+`, no leading zeros, no `-0` |
+| `rcmp4` / `rcmp6` / `rcmp9` | sequence of reals, max absolute **or** relative error 1e-4 / 1e-6 / 1e-9; `nan`/`inf` in the output are rejected |
 | `nyesno` | sequence of case-insensitive `YES`/`NO` tokens |
+
+These follow testlib's comparison semantics, with one deliberate exception: a
+length mismatch is always reported, in either direction. testlib's `lcmp` and
+`rcmp*` stop at the end of the answer file and silently ignore trailing output,
+which would hide a real bug during stress testing.
 
 For problems with multiple valid answers, pass your own checker with `-k`. It is invoked
 in testlib order — `checker <input> <output> <answer>` (plus `--checker-args`) — and its
