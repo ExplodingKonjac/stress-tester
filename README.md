@@ -63,8 +63,9 @@ stress-tester --version
 If the command is not found, open a new shell so the updated `PATH` takes effect.
 
 You also need a compiler or interpreter for the *programs you want to test* — a C/C++
-compiler (`gcc`/`clang`), `rustc`, or `python3`, depending on what your solutions are
-written in. Any of them already on your `PATH` is picked up automatically.
+compiler (`gcc`/`clang`), `rustc`, a JDK, `go`, `node`, or `python3`, depending on what
+your solutions are written in. Any of them already on your `PATH` is picked up
+automatically.
 
 ## Usage
 
@@ -72,15 +73,37 @@ written in. Any of them already on your `PATH` is picked up automatically.
 stress-tester -c <candidate> -r <reference> -g <generator> [options]
 ```
 
-The three programs are given as **source files**; the tool detects the language from the
-extension, compiles what needs compiling, and caches the binaries.
+The three programs are usually given as **source files**; the tool detects the language
+from the extension, compiles what needs compiling, and caches the binaries.
 
-| Extension | Language | Default flags | Compiler |
+| Extension | Language | Default flags | Toolchain |
 |---|---|---|---|
 | `.c` | C | `-O2 -std=c11` | `--cc`, `$CC`, then `cc`/`gcc`/`clang` |
 | `.cpp` `.cc` `.cxx` `.c++` | C++ | `-O2 -std=c++17` | `--cxx`, `$CXX`, then `c++`/`g++`/`clang++` |
 | `.rs` | Rust | `-O` | `--rustc`, then `rustc` |
+| `.go` | Go | — | `--go`, then `go` |
+| `.java` | Java | — | `--javac`, `$JAVAC`, then `javac`; run with `--java`/`java` |
 | `.py` | Python | — (interpreted) | `--python`, then `python3`/`python` |
+| `.js` | JavaScript | — (interpreted) | `--node`, then `node`/`nodejs` |
+
+For Java the class name has to match the file stem, as the language requires:
+`Main.java` is compiled with `javac -d <cache>` and run as `java -cp <cache> Main`.
+Compiler flags reach `javac`, not the launcher, so JVM options such as `-Xss` cannot be
+set. PyPy needs no special support — pass `--python pypy3`.
+
+### Pre-built programs
+
+Any of the four programs may instead be an **already-built executable**, which is run
+as-is with no compilation and no caching:
+
+```sh
+stress-tester -c ./my_solution -r ./trusted -g gen.cpp
+```
+
+A file is treated as pre-built when its extension is not one of the above and it is
+executable: the executable bit on Linux/macOS (which also covers `#!` scripts), or an
+`.exe`/`.com` extension on Windows. `.bat`/`.cmd` are not accepted, since Windows cannot
+launch them without going through `cmd.exe`.
 
 The generator receives the seed as its **last** argument, so any testlib generator using
 `registerGen(argc, argv, 1)` works unchanged. Seeds start at `--start-seed` and increase

@@ -30,6 +30,10 @@ pub fn run(cli: &Cli) -> Result<i32> {
         cxx: cli.cxx.clone(),
         rustc: cli.rustc.clone(),
         python: cli.python.clone(),
+        javac: cli.javac.clone(),
+        java: cli.java.clone(),
+        go: cli.go.clone(),
+        node: cli.node.clone(),
     };
 
     // Build all programs (serially, so the cache is race-free).
@@ -273,20 +277,13 @@ fn build_program(
         flags,
     };
     let result = lang::build(source, &opts)?;
-    let note = if !result.language.compiled() {
-        "interpreted"
-    } else if result.cached {
-        "cached"
-    } else {
-        "compiled"
-    };
     println!(
         "  {} {:<10} {:<24} ({}, {})",
         "✓".green(),
         role,
         result.program.display,
         result.language.name(),
-        note
+        result.note()
     );
     Ok(result)
 }

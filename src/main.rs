@@ -121,6 +121,22 @@ struct Cli {
     #[arg(long)]
     python: Option<String>,
 
+    /// Java compiler (javac) override
+    #[arg(long)]
+    javac: Option<String>,
+
+    /// Java launcher (java) override
+    #[arg(long)]
+    java: Option<String>,
+
+    /// Go toolchain (go) override
+    #[arg(long)]
+    go: Option<String>,
+
+    /// Node.js interpreter override
+    #[arg(long)]
+    node: Option<String>,
+
     /// Compilation cache directory
     #[arg(long)]
     cache_dir: Option<std::path::PathBuf>,
