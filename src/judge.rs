@@ -38,10 +38,16 @@ impl AuxProgram {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    pub time: Duration,
+    /// CPU time (user + system).
+    pub cpu_time: Duration,
     /// Bytes.
     pub memory: u64,
 }
+
+/// Extra wall-clock time a program gets on top of its CPU limit before it counts
+/// as hung. Generous on purpose: it only has to catch programs that block without
+/// burning CPU, and a loaded machine stretches wall clock well past CPU time.
+const WALL_SLACK: Duration = Duration::from_secs(10);
 
 pub enum Checker {
     Builtin(BuiltinChecker),
@@ -74,7 +80,9 @@ pub struct Judge {
 pub struct TestReport {
     pub seed: u64,
     pub verdict: Verdict,
+    /// CPU time of the candidate — the judged figure.
     pub candidate_time: Duration,
+    pub candidate_wall_time: Duration,
     pub candidate_memory: u64,
     pub message: String,
     pub failed_aux: Option<AuxProgram>,
@@ -92,6 +100,7 @@ impl TestReport {
             seed,
             verdict: Verdict::Ac,
             candidate_time: Duration::ZERO,
+            candidate_wall_time: Duration::ZERO,
             candidate_memory: 0,
             message: String::new(),
             failed_aux: None,
@@ -161,15 +170,12 @@ impl Judge {
             Some(&report.candidate_stderr),
             self.candidate_limits,
         )?;
-        report.candidate_time = stats.wall_time;
+        report.candidate_time = stats.cpu_time;
+        report.candidate_wall_time = stats.wall_time;
         report.candidate_memory = stats.peak_memory;
         if stats.timed_out {
             report.verdict = Verdict::Tle;
-            report.message = format!(
-                "time limit exceeded: {:.3}s > {:.3}s",
-                stats.wall_time.as_secs_f64(),
-                self.candidate_limits.time.as_secs_f64()
-            );
+            report.message = timeout_message(&stats, self.candidate_limits.cpu_time);
             return Ok(report);
         }
         if stats.memory_exceeded || stats.peak_memory > self.candidate_limits.memory {
@@ -247,9 +253,8 @@ impl Judge {
                         &mut report,
                         AuxProgram::Checker,
                         format!(
-                            "checker timed out: {:.3}s > {:.3}s",
-                            stats.wall_time.as_secs_f64(),
-                            self.checker_limits.time.as_secs_f64()
+                            "checker {}",
+                            timeout_message(&stats, self.checker_limits.cpu_time)
                         ),
                     );
                     return Ok(report);
@@ -318,10 +323,28 @@ fn run(
         stdin_file,
         stdout_file,
         stderr_file,
-        time_limit: limits.time,
+        cpu_limit: limits.cpu_time,
+        wall_limit: limits.cpu_time.saturating_add(WALL_SLACK),
         memory_limit: limits.memory,
     };
     runner::run(&spec).map_err(Into::into)
+}
+
+/// Message for a run the runner killed on time — CPU limit or wall backstop.
+fn timeout_message(stats: &runner::RunStats, limit: Duration) -> String {
+    if stats.hung {
+        format!(
+            "idle too long: still running after {:.3}s wall clock, having used {:.3}s of CPU",
+            stats.wall_time.as_secs_f64(),
+            stats.cpu_time.as_secs_f64()
+        )
+    } else {
+        format!(
+            "time limit exceeded: {:.3}s > {:.3}s of CPU",
+            stats.cpu_time.as_secs_f64(),
+            limit.as_secs_f64()
+        )
+    }
 }
 
 /// Mark a test as FAILED because an auxiliary (trusted) program misbehaved.
@@ -340,10 +363,9 @@ fn aux_failure(
 ) -> Option<String> {
     if stats.timed_out {
         return Some(format!(
-            "{} timed out: {:.3}s > {:.3}s",
+            "{} {}",
             which.name(),
-            stats.wall_time.as_secs_f64(),
-            limits.time.as_secs_f64()
+            timeout_message(stats, limits.cpu_time)
         ));
     }
     if stats.memory_exceeded || stats.peak_memory > limits.memory {

@@ -80,7 +80,7 @@ pub fn run(cli: &Cli) -> Result<i32> {
     };
 
     let lim = |t: f64, m: u64| Limits {
-        time: Duration::from_secs_f64(t),
+        cpu_time: Duration::from_secs_f64(t),
         memory: m * 1024 * 1024,
     };
     let judge = Arc::new(Judge {

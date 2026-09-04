@@ -65,7 +65,7 @@ pub fn print_banner(b: &Banner) {
     println!(
         "  {:<10} TL {} / ML {}",
         "limits:",
-        format_secs(b.limits.time),
+        format_secs(b.limits.cpu_time),
         crate::judge::format_memory(b.limits.memory),
     );
     println!(
@@ -104,9 +104,10 @@ pub fn print_failure(report: &TestReport, limits: &Limits, artifact_dir: Option<
     };
     println!("{} on test #{}", title, report.seed);
     println!(
-        "         time: {} (limit {})   memory: {} (limit {})",
+        "         cpu: {} (limit {})   wall: {}   memory: {} (limit {})",
         fmt_duration(report.candidate_time),
-        format_secs(limits.time),
+        format_secs(limits.cpu_time),
+        fmt_duration(report.candidate_wall_time),
         crate::judge::format_memory(report.candidate_memory),
         crate::judge::format_memory(limits.memory),
     );

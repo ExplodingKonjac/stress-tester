@@ -18,7 +18,7 @@ Test Information
   reference: ac.cpp (C++)
   generator: gen.cpp (C++)
   checker:   wcmp (builtin)
-  limits:    TL 1s / ML 512.0 MB
+  limits:    TL 1s (cpu) / ML 512.0 MB
   metadata:  4 jobs, 100 tests, initial seed = 1
 
 AC on test #1            3 ms      2.1 MB
@@ -26,7 +26,7 @@ AC on test #2            3 ms      2.1 MB
 WA on test #3            3 ms      2.1 MB
 
 WA on test #3
-         time: 3 ms (limit 1s)   memory: 2.1 MB (limit 512.0 MB)
+         cpu: 3 ms (limit 1s)   wall: 4 ms   memory: 2.1 MB (limit 512.0 MB)
          token 1 differs: expected "20", found "18"
          diff (- = expected, + = found):
          - 20
@@ -118,7 +118,7 @@ the same failing test.
 -g, --generator <FILE>   testcase generator (gets the seed as last argument)
 -n, --max-tests <N>      stop after N tests (default: run until failure or Ctrl-C)
 -j, --jobs <N>           parallel workers (default 1)
--t, --time-limit <SEC>   candidate time limit (default 1.0)
+-t, --time-limit <SEC>   candidate CPU time limit (default 1.0)
 -m, --memory-limit <MB>  candidate memory limit (default 512)
 -s, --start-seed <N>     first seed (default 1)
 -o, --output <DIR>       where to save the failing test (default stress-output)
@@ -126,6 +126,10 @@ the same failing test.
 -k, --checker <FILE>     custom testlib-format checker
     --gen-args "<ARGS>"  extra generator arguments, inserted before the seed
 ```
+
+Time limits are **CPU time** (user + system), not wall clock, so a verdict does not
+change because the machine is busy — raising `-j` is safe. See
+[Limits](#how-it-works) for the wall-clock backstop that still catches hangs.
 
 Auxiliary programs have their own generous limits (`--gen-time-limit`,
 `--ref-memory-limit`, `--checker-time-limit`, …; 60 s / 512 MB by default), and each
@@ -191,16 +195,23 @@ Successful tests leave nothing behind, and the scratch directory is removed on e
   in private scratch directories. The first failure sets a stop flag, so in-flight tests
   finish but no new ones start — with `-j 4` the reported failure is the first one
   *observed*, not necessarily the lowest failing seed.
-- **Limits.** On Unix the candidate is run in its own process group, its peak RSS polled
-  from `/proc/<pid>/status`, and it is `SIGKILL`ed on the first time or memory violation.
-  On Windows each program runs in a Job Object with a process memory limit, and peak usage
-  is read back with `QueryInformationJobObject`.
+- **Limits.** The judged clock is CPU time (user + system), so verdicts do not depend on
+  machine load. On Unix the candidate runs in its own process group; every 2 ms its CPU
+  clock and its peak RSS (`/proc/<pid>/status`) are polled, and it is `SIGKILL`ed on the
+  first violation. On Windows it runs in a Job Object, polled the same way via
+  `GetProcessTimes`, and peak memory is read back with `QueryInformationJobObject`. The
+  final figure comes from `wait4`'s `rusage` (Unix) so it is exact, not a sampled value.
+- **Wall-clock backstop.** No CPU limit can catch a program that blocks forever without
+  burning CPU — a deadlock on stdin, a `sleep`. Each program therefore also gets its CPU
+  limit + 10 s of wall clock; exceeding that is still `TLE`, reported as `idle too long`
+  to distinguish it from a genuine time limit exceeded. Compilation is the one thing
+  limited purely on wall clock (120 s).
 - **Ctrl-C** stops the run cleanly and reports how many tests had passed.
 
 ## Development
 
 ```sh
-cargo test          # unit tests for checkers, language detection, cache keys
+cargo test          # unit tests for checkers, language detection, cache keys, limits
 cargo clippy
 ```
 

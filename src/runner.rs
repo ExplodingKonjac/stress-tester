@@ -1,8 +1,14 @@
 //! Process execution with time/memory limits and resource measurement.
 //!
+//! The judged clock is CPU time (user + system), not wall clock, so verdicts do
+//! not depend on how busy the machine is. `wall_limit` remains as a backstop for
+//! programs that block forever without burning CPU, which no CPU limit can catch.
+//!
 //! All stdio is redirected to files, so there are no pipes to deadlock on.
-//! Unix: `wait4(WNOHANG)` polling gives per-child `ru_maxrss`.
-//! Windows: the child runs inside a Job Object; peak memory is queried after exit.
+//! Unix: `wait4(WNOHANG)` polling gives per-child `rusage`; live CPU time comes
+//! from the process' own CPU clock.
+//! Windows: the child runs inside a Job Object; peak memory is queried after exit
+//! and CPU time from `GetProcessTimes`.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -28,19 +34,34 @@ pub struct RunSpec<'a> {
     pub stdin_file: Option<&'a Path>,
     pub stdout_file: Option<&'a Path>,
     pub stderr_file: Option<&'a Path>,
-    pub time_limit: Duration,
+    /// CPU time (user + system); `Duration::MAX` disables the check.
+    pub cpu_limit: Duration,
+    /// Wall-clock backstop, for programs that block without burning CPU.
+    pub wall_limit: Duration,
     /// Bytes; `u64::MAX` disables the check.
     pub memory_limit: u64,
 }
 
 /// Measured outcome of one run.
 pub struct RunStats {
+    /// Killed for exceeding a time limit — either kind.
     pub timed_out: bool,
+    /// The kill came from `wall_limit` rather than `cpu_limit`. Diagnostic only.
+    pub hung: bool,
     pub memory_exceeded: bool,
+    /// CPU time (user + system) actually consumed.
+    pub cpu_time: Duration,
     pub wall_time: Duration,
     /// Peak RSS in bytes (best effort).
     pub peak_memory: u64,
     pub exit: ExitKind,
+}
+
+/// Over the limit, judged at the millisecond granularity the reports print. Any
+/// stricter and a kill at 500.4 ms against a 500 ms limit reports itself as
+/// "0.500s > 0.500s"; this way the printed comparison is always literally true.
+fn over(spent: Duration, limit: Duration) -> bool {
+    spent.as_millis() > limit.as_millis()
 }
 
 // ---------------------------------------------------------------------------
@@ -66,11 +87,16 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
     // Note: dropping `child` does not kill or reap it; we reap via wait4.
     let child = cmd.spawn()?;
     let pid = child.id() as libc::pid_t;
+    // Resolved once: the clock id is a pure function of the pid.
+    let clock = cpu_clock(pid);
 
     let start = Instant::now();
     let mut timed_out = false;
+    let mut hung = false;
     let mut memory_exceeded = false;
+    let mut killed = false;
     let mut peak = 0u64;
+    let cpu;
     let exit;
 
     loop {
@@ -82,32 +108,41 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
         }
         if r == pid {
             peak = peak.max(ru_maxrss_bytes(&ru));
+            cpu = ru_cpu_time(&ru);
             exit = decode_status(status);
             break;
         }
-        if !timed_out && start.elapsed() >= spec.time_limit {
-            timed_out = true;
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        } else if !timed_out
-            && !memory_exceeded
-            && let Some(vm) = vm_hwm_bytes(pid)
-            && vm > spec.memory_limit
-        {
-            peak = peak.max(vm);
-            memory_exceeded = true;
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        } else if !timed_out && !memory_exceeded {
-            // Still within the limit: just record the peak.
-            if let Some(vm) = vm_hwm_bytes(pid) {
+        if !killed {
+            if let Some(c) = cpu_time(clock)
+                && over(c, spec.cpu_limit)
+            {
+                timed_out = true;
+            } else if start.elapsed() >= spec.wall_limit {
+                timed_out = true;
+                hung = true;
+            } else if let Some(vm) = vm_hwm_bytes(pid) {
                 peak = peak.max(vm);
+                memory_exceeded = vm > spec.memory_limit;
+            }
+            if timed_out || memory_exceeded {
+                killed = true;
+                unsafe { libc::kill(pid, libc::SIGKILL) };
             }
         }
         std::thread::sleep(POLL_INTERVAL);
     }
 
+    // Catches a program that crossed the limit and exited inside a single poll
+    // interval, and platforms with no live CPU clock to poll.
+    if !timed_out && over(cpu, spec.cpu_limit) {
+        timed_out = true;
+    }
+
     Ok(RunStats {
         timed_out,
+        hung,
         memory_exceeded,
+        cpu_time: cpu,
         wall_time: start.elapsed(),
         peak_memory: peak,
         exit,
@@ -150,6 +185,49 @@ fn ru_maxrss_bytes(ru: &libc::rusage) -> u64 {
     ru.ru_maxrss.max(0) as u64
 }
 
+/// Total CPU time (user + system) of a reaped child.
+#[cfg(unix)]
+fn ru_cpu_time(ru: &libc::rusage) -> Duration {
+    let tv = |t: libc::timeval| {
+        Duration::new(
+            t.tv_sec.max(0) as u64,
+            (t.tv_usec.clamp(0, 999_999) as u32) * 1000,
+        )
+    };
+    tv(ru.ru_utime) + tv(ru.ru_stime)
+}
+
+/// The child's own CPU clock, for a live time-limit poll (Linux only).
+#[cfg(all(unix, target_os = "linux"))]
+fn cpu_clock(pid: libc::pid_t) -> Option<libc::clockid_t> {
+    let mut clk: libc::clockid_t = 0;
+    // Returns an errno directly, not -1.
+    (unsafe { libc::clock_getcpuclockid(pid, &mut clk) } == 0).then_some(clk)
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn cpu_time(clock: Option<libc::clockid_t>) -> Option<Duration> {
+    let clk = clock?;
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    (unsafe { libc::clock_gettime(clk, &mut ts) } == 0).then(|| {
+        Duration::new(
+            ts.tv_sec.max(0) as u64,
+            ts.tv_nsec.clamp(0, 999_999_999) as u32,
+        )
+    })
+}
+
+/// With no live clock to poll, the CPU limit is enforced post-hoc from `rusage`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn cpu_clock(_pid: libc::pid_t) -> Option<libc::clockid_t> {
+    None
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn cpu_time(_clock: Option<libc::clockid_t>) -> Option<Duration> {
+    None
+}
+
 /// Live peak-RSS poll for an early memory-limit kill (Linux only).
 #[cfg(all(unix, target_os = "linux"))]
 fn vm_hwm_bytes(pid: libc::pid_t) -> Option<u64> {
@@ -174,6 +252,27 @@ fn vm_hwm_bytes(_pid: libc::pid_t) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
+const POLL_INTERVAL_MS: u32 = 2;
+
+/// CPU time (kernel + user) of a process. The handle stays valid after the
+/// process exits, so this can also be read once it is gone.
+#[cfg(windows)]
+fn process_cpu_time(process: windows_sys::Win32::Foundation::HANDLE) -> Option<Duration> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    let mut created: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exited: FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: FILETIME = unsafe { std::mem::zeroed() };
+    let ok =
+        unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
+    // FILETIME durations are in 100 ns units.
+    let ticks = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+    (ok != 0).then(|| Duration::from_nanos((ticks(kernel) + ticks(user)) * 100))
+}
+
+#[cfg(windows)]
 pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
     use windows_sys::Win32::Foundation::{
         CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
@@ -191,7 +290,6 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
         STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
     };
 
-    const WAIT_OBJECT_0: u32 = 0;
     const WAIT_TIMEOUT: u32 = 0x0000_0102;
     const CREATE_ALWAYS: u32 = 2;
 
@@ -287,24 +385,32 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
 
         let start = Instant::now();
         let mut timed_out = false;
+        let mut hung = false;
         loop {
-            let remaining = spec
-                .time_limit
-                .saturating_sub(start.elapsed())
-                .as_millis()
-                .clamp(1, u32::MAX as u128) as u32;
-            let wait = unsafe { WaitForSingleObject(pi.hProcess, remaining) };
-            if wait == WAIT_OBJECT_0 {
+            let wait = unsafe { WaitForSingleObject(pi.hProcess, POLL_INTERVAL_MS) };
+            if wait != WAIT_TIMEOUT {
+                // Exited, or the wait itself failed — either way, stop polling.
                 break;
             }
-            if wait == WAIT_TIMEOUT && start.elapsed() >= spec.time_limit {
+            if process_cpu_time(pi.hProcess).is_some_and(|c| over(c, spec.cpu_limit)) {
                 timed_out = true;
+            } else if start.elapsed() >= spec.wall_limit {
+                timed_out = true;
+                hung = true;
+            }
+            if timed_out {
                 unsafe {
                     TerminateProcess(pi.hProcess, 1);
                     WaitForSingleObject(pi.hProcess, u32::MAX);
                 }
                 break;
             }
+        }
+
+        // The handle stays valid after exit, so this is the exact final figure.
+        let cpu = process_cpu_time(pi.hProcess).unwrap_or_default();
+        if !timed_out && over(cpu, spec.cpu_limit) {
+            timed_out = true;
         }
 
         let mut exit_code: u32 = 0;
@@ -327,7 +433,9 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
 
         Ok(RunStats {
             timed_out,
+            hung,
             memory_exceeded: peak > spec.memory_limit,
+            cpu_time: cpu,
             wall_time: start.elapsed(),
             peak_memory: peak,
             exit: ExitKind::Code(exit_code as i32),
@@ -349,4 +457,53 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
         }
     }
     result
+}
+
+/// Enforcement tests for the live CPU clock, which only Linux polls; elsewhere
+/// the CPU limit is applied post-hoc and these timings would not hold.
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn run_limited(argv: &[&str], cpu_ms: u64, wall_ms: u64) -> RunStats {
+        let argv: Vec<OsString> = argv.iter().map(|a| OsString::from(*a)).collect();
+        run(&RunSpec {
+            argv: &argv,
+            stdin_file: None,
+            stdout_file: None,
+            stderr_file: None,
+            cpu_limit: Duration::from_millis(cpu_ms),
+            wall_limit: Duration::from_millis(wall_ms),
+            memory_limit: u64::MAX,
+        })
+        .expect("failed to spawn")
+    }
+
+    #[test]
+    fn cpu_limit_kills_a_busy_loop() {
+        let s = run_limited(&["sh", "-c", "while :; do :; done"], 200, 5_000);
+        assert!(s.timed_out, "a busy loop must hit the CPU limit");
+        assert!(!s.hung, "the wall backstop must not be what killed it");
+        assert!(
+            s.cpu_time >= Duration::from_millis(150),
+            "cpu {:?}",
+            s.cpu_time
+        );
+        assert!(
+            s.wall_time < Duration::from_secs(2),
+            "killed late: wall {:?}",
+            s.wall_time
+        );
+    }
+
+    #[test]
+    fn wall_backstop_kills_an_idle_process() {
+        let s = run_limited(&["sleep", "5"], 200, 300);
+        assert!(s.timed_out && s.hung, "sleep must trip the wall backstop");
+        assert!(
+            s.cpu_time < Duration::from_millis(100),
+            "sleeping burns no cpu, got {:?}",
+            s.cpu_time
+        );
+    }
 }

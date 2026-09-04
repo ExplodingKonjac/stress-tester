@@ -351,7 +351,10 @@ pub fn build(source: &Path, opts: &BuildOptions) -> Result<BuildResult> {
         stdin_file: None,
         stdout_file: Some(&out_log),
         stderr_file: Some(&err_log),
-        time_limit: COMPILE_TIMEOUT,
+        // Compilation is limited on wall clock: a compiler that stalls on disk or
+        // network is not a CPU-time question.
+        cpu_limit: Duration::MAX,
+        wall_limit: COMPILE_TIMEOUT,
         memory_limit: u64::MAX,
     };
     let stats =

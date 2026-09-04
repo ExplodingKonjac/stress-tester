@@ -33,7 +33,7 @@ struct Cli {
     #[arg(long)]
     check: Option<String>,
 
-    /// Time limit for the candidate, in seconds
+    /// CPU time limit for the candidate, in seconds
     #[arg(short = 't', long, default_value_t = 1.0)]
     time_limit: f64,
 
@@ -57,7 +57,7 @@ struct Cli {
     #[arg(short = 's', long, default_value_t = 1)]
     start_seed: u64,
 
-    /// Time limit for the generator, in seconds
+    /// CPU time limit for the generator, in seconds
     #[arg(long, default_value_t = 60.0)]
     gen_time_limit: f64,
 
@@ -65,7 +65,7 @@ struct Cli {
     #[arg(long, default_value_t = 512)]
     gen_memory_limit: u64,
 
-    /// Time limit for the reference, in seconds
+    /// CPU time limit for the reference, in seconds
     #[arg(long, default_value_t = 60.0)]
     ref_time_limit: f64,
 
@@ -73,7 +73,7 @@ struct Cli {
     #[arg(long, default_value_t = 512)]
     ref_memory_limit: u64,
 
-    /// Time limit for a custom checker, in seconds
+    /// CPU time limit for a custom checker, in seconds
     #[arg(long, default_value_t = 60.0)]
     checker_time_limit: f64,
 
