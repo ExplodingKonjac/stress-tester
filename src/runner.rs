@@ -98,10 +98,7 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
     // Kernel-enforced backstops, applied in the child between fork and exec.
     // Skipped for compilation (`u64::MAX`), which keeps the inherited limits.
     if spec.memory_limit != u64::MAX {
-        let data = spec
-            .memory_limit
-            .saturating_mul(4)
-            .max(DATA_LIMIT_FLOOR) as libc::rlim_t;
+        let data = spec.memory_limit.saturating_mul(4).max(DATA_LIMIT_FLOOR) as libc::rlim_t;
         // SAFETY: the closure runs in the forked child before exec, so it may only
         // call async-signal-safe functions. get/setrlimit are bare syscalls and
         // `last_os_error` only reads errno; nothing here allocates.
@@ -361,8 +358,7 @@ fn process_cpu_time(process: windows_sys::Win32::Foundation::HANDLE) -> Option<D
     let mut exited: FILETIME = unsafe { std::mem::zeroed() };
     let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
     let mut user: FILETIME = unsafe { std::mem::zeroed() };
-    let ok =
-        unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
+    let ok = unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
     // FILETIME durations are in 100 ns units.
     let ticks = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
     (ok != 0).then(|| Duration::from_nanos((ticks(kernel) + ticks(user)) * 100))
