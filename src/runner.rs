@@ -6,9 +6,10 @@
 //!
 //! All stdio is redirected to files, so there are no pipes to deadlock on.
 //! Unix: `wait4(WNOHANG)` polling gives per-child `rusage`; live CPU time comes
-//! from the process' own CPU clock.
-//! Windows: the child runs inside a Job Object; peak memory is queried after exit
-//! and CPU time from `GetProcessTimes`.
+//! from the process' own CPU clock, and a `pre_exec` hook sets the rlimits.
+//! Windows: the child runs inside a Job Object carrying a kernel-enforced commit
+//! cap; CPU time and peak memory are polled from `GetProcessTimes` and
+//! `QueryInformationJobObject`.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -52,7 +53,8 @@ pub struct RunStats {
     /// CPU time (user + system) actually consumed.
     pub cpu_time: Duration,
     pub wall_time: Duration,
-    /// Peak RSS in bytes (best effort).
+    /// Peak memory in bytes (best effort): resident on Unix, committed on Windows,
+    /// where the kernel job cap is on commit charge too.
     pub peak_memory: u64,
     pub exit: ExitKind,
 }
@@ -71,6 +73,15 @@ fn over(spent: Duration, limit: Duration) -> bool {
 #[cfg(unix)]
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
+/// Heap ceiling handed to a judged child, as a multiple of its memory limit but
+/// never below this floor. Generous on purpose: the poll below is what decides
+/// MLE, and this only has to stop a runaway from outrunning it and leaving the
+/// OOM killer to pick a victim. The floor is set well above what a language
+/// runtime needs before it runs a line — Node wants ~1 GB of private anonymous
+/// memory for V8, and a tighter cap kills it during startup.
+#[cfg(unix)]
+const DATA_LIMIT_FLOOR: u64 = 2 * 1024 * 1024 * 1024;
+
 #[cfg(unix)]
 pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
     use std::os::unix::process::CommandExt;
@@ -83,6 +94,46 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
     cmd.stdin(open_or_null(spec.stdin_file, false)?);
     cmd.stdout(open_or_null(spec.stdout_file, true)?);
     cmd.stderr(open_or_null(spec.stderr_file, true)?);
+
+    // Kernel-enforced backstops, applied in the child between fork and exec.
+    // Skipped for compilation (`u64::MAX`), which keeps the inherited limits.
+    if spec.memory_limit != u64::MAX {
+        let data = spec
+            .memory_limit
+            .saturating_mul(4)
+            .max(DATA_LIMIT_FLOOR) as libc::rlim_t;
+        // SAFETY: the closure runs in the forked child before exec, so it may only
+        // call async-signal-safe functions. get/setrlimit are bare syscalls and
+        // `last_os_error` only reads errno; nothing here allocates.
+        unsafe {
+            cmd.pre_exec(move || {
+                // The stack goes to *unlimited*, not to the memory limit: deep
+                // recursion is ordinary competitive-programming practice and dies
+                // at the inherited 8 MB, but glibc derives its default thread
+                // stack size from this limit, so any large finite value makes
+                // `std::thread` fail with EAGAIN. Unlimited leaves glibc on its own
+                // default. Runaway recursion is still caught — stack pages are RSS,
+                // so the poll below sees them.
+                for (resource, want) in [
+                    (libc::RLIMIT_STACK, libc::RLIM_INFINITY),
+                    (libc::RLIMIT_DATA, data),
+                ] {
+                    let mut lim: libc::rlimit = std::mem::zeroed();
+                    if libc::getrlimit(resource, &mut lim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // Never raise past the inherited hard limit: an unprivileged
+                    // process cannot, and failing the spawn over it would be worse
+                    // than judging under a tighter cap.
+                    lim.rlim_cur = want.min(lim.rlim_max);
+                    if libc::setrlimit(resource, &lim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
 
     // Note: dropping `child` does not kill or reap it; we reap via wait4.
     let child = cmd.spawn()?;
@@ -254,6 +305,51 @@ fn vm_hwm_bytes(_pid: libc::pid_t) -> Option<u64> {
 #[cfg(windows)]
 const POLL_INTERVAL_MS: u32 = 2;
 
+/// The kernel job cap sits at the judged limit plus the larger of the limit itself
+/// and this floor. That gap is not slack for the poll below: the kernel checks
+/// every commit call, so a *single* allocation landing inside the gap succeeds and
+/// the poll reports MLE, while anything past the cap is refused outright and
+/// surfaces as `std::bad_alloc` — an RE. A generous gap keeps the common
+/// wrong-length `vector<int> v(n)` an MLE instead of a crash.
+#[cfg(windows)]
+const MEMORY_HEADROOM_MIN: u64 = 64 * 1024 * 1024;
+
+/// Closes a Windows handle on drop, so an early return cannot leak it. Used for
+/// the job handle, which `run` owns from creation until it returns.
+#[cfg(windows)]
+struct OwnedHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// Peak committed memory of the job. `PeakJobMemoryUsed` covers the processes
+/// still associated with the job and `PeakProcessMemoryUsed` any that ever were,
+/// so the larger of the two is right both during the run and after the child has
+/// exited.
+#[cfg(windows)]
+fn job_peak_memory(job: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
+    use windows_sys::Win32::System::JobObjects::{
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject,
+    };
+
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        QueryInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &mut info as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then(|| info.PeakJobMemoryUsed.max(info.PeakProcessMemoryUsed) as u64)
+}
+
 /// CPU time (kernel + user) of a process. The handle stays valid after the
 /// process exits, so this can also be read once it is gone.
 #[cfg(windows)]
@@ -282,8 +378,9 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{
         CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, PROCESS_INFORMATION, ResumeThread,
@@ -328,6 +425,42 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
         Ok(h)
     };
 
+    // The job carries the kernel-enforced memory cap. Set it up before any file
+    // handle exists, and hold it in a guard, so no early return leaks a handle.
+    let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if raw_job.is_null() || raw_job == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let job = OwnedHandle(raw_job);
+    // Judged programs only. Compilation passes `u64::MAX` and keeps a bare job:
+    // MSVC's `mspdbsrv.exe` is meant to outlive a build and be shared between
+    // concurrent ones, and KILL_ON_JOB_CLOSE would take it down with us.
+    if spec.memory_limit != u64::MAX {
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // One call, deliberately: this replaces LimitFlags wholesale, so a second
+        // SetInformationJobObject would silently drop whatever it does not repeat.
+        // KILL_ON_JOB_CLOSE means nothing in the job outlives it, grandchildren
+        // included — which is also why every figure must be read before it closes.
+        info.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // Saturating: SIZE_T is 32 bits on 32-bit Windows.
+        info.JobMemoryLimit = spec
+            .memory_limit
+            .saturating_add(spec.memory_limit.max(MEMORY_HEADROOM_MIN))
+            .min(usize::MAX as u64) as usize;
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
     let h_stdin = open_file(spec.stdin_file, false)?;
     let h_stdout = open_file(spec.stdout_file, true)?;
     let h_stderr = open_file(spec.stderr_file, true)?;
@@ -340,11 +473,6 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
         .collect::<Vec<_>>()
         .join(" ");
     let mut cmdline_wide = to_wide(cmdline.as_ref());
-
-    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-    if job.is_null() || job == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
-    }
 
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
@@ -378,14 +506,28 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
             CloseHandle(h_stdin);
             CloseHandle(h_stdout);
             CloseHandle(h_stderr);
-
-            AssignProcessToJobObject(job, pi.hProcess);
-            ResumeThread(pi.hThread);
+        }
+        // The cap only exists if the process is actually in the job, so a failure
+        // here cannot be ignored. The child is still suspended and outside the
+        // job, so `KILL_ON_JOB_CLOSE` would not reach it: kill it directly.
+        if unsafe { AssignProcessToJobObject(job.0, pi.hProcess) } == 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { TerminateProcess(pi.hProcess, 1) };
+            return Err(e);
+        }
+        // Failure here would leave the child suspended forever, and the only thing
+        // that would notice is the wall backstop, 10 s later, once per test.
+        if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
+            let e = std::io::Error::last_os_error();
+            unsafe { TerminateJobObject(job.0, 1) };
+            return Err(e);
         }
 
         let start = Instant::now();
         let mut timed_out = false;
         let mut hung = false;
+        let mut memory_exceeded = false;
+        let mut peak = 0u64;
         loop {
             let wait = unsafe { WaitForSingleObject(pi.hProcess, POLL_INTERVAL_MS) };
             if wait != WAIT_TIMEOUT {
@@ -397,10 +539,13 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
             } else if start.elapsed() >= spec.wall_limit {
                 timed_out = true;
                 hung = true;
+            } else if let Some(m) = job_peak_memory(job.0) {
+                peak = peak.max(m);
+                memory_exceeded = peak > spec.memory_limit;
             }
-            if timed_out {
+            if timed_out || memory_exceeded {
                 unsafe {
-                    TerminateProcess(pi.hProcess, 1);
+                    TerminateJobObject(job.0, 1);
                     WaitForSingleObject(pi.hProcess, u32::MAX);
                 }
                 break;
@@ -412,29 +557,17 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
         if !timed_out && over(cpu, spec.cpu_limit) {
             timed_out = true;
         }
+        peak = peak.max(job_peak_memory(job.0).unwrap_or(0));
 
         let mut exit_code: u32 = 0;
         unsafe { GetExitCodeProcess(pi.hProcess, &mut exit_code) };
 
-        let mut peak = 0u64;
-        unsafe {
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            let ok = QueryInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &mut info as *mut _ as *mut core::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            );
-            if ok != 0 {
-                peak = info.PeakJobMemoryUsed as u64;
-            }
-        }
-
         Ok(RunStats {
             timed_out,
             hung,
-            memory_exceeded: peak > spec.memory_limit,
+            // Still post-hoc as well: a burst inside one poll interval can cross
+            // the limit without the loop ever seeing it.
+            memory_exceeded: memory_exceeded || peak > spec.memory_limit,
             cpu_time: cpu,
             wall_time: start.elapsed(),
             peak_memory: peak,
@@ -447,8 +580,9 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunStats> {
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
         }
-        CloseHandle(job);
     }
+    // `job` is dropped after this, closing the job last: with
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE that also reaps anything left inside it.
     if created == 0 {
         unsafe {
             CloseHandle(h_stdin);

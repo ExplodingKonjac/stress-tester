@@ -18,7 +18,7 @@ Test Information
   reference: ac.cpp (C++)
   generator: gen.cpp (C++)
   checker:   wcmp (builtin)
-  limits:    TL 1s (cpu) / ML 512.0 MB
+  limits:    TL 1s / ML 512.0 MB
   metadata:  4 jobs, 100 tests, initial seed = 1
 
 AC on test #1            3 ms      2.1 MB
@@ -185,28 +185,6 @@ checker.log   checker verdict message
 ```
 
 Successful tests leave nothing behind, and the scratch directory is removed on exit.
-
-## How it works
-
-- **Compile cache.** Binaries live in `<system cache dir>/stress-tester` (override with
-  `--cache-dir`), keyed by the SHA-256 of language, compiler identity and version, flags,
-  and source content. Editing any of them recompiles just that program; nothing else.
-- **Parallelism.** `-j N` workers pull seeds from a shared counter and judge independently
-  in private scratch directories. The first failure sets a stop flag, so in-flight tests
-  finish but no new ones start — with `-j 4` the reported failure is the first one
-  *observed*, not necessarily the lowest failing seed.
-- **Limits.** The judged clock is CPU time (user + system), so verdicts do not depend on
-  machine load. On Unix the candidate runs in its own process group; every 2 ms its CPU
-  clock and its peak RSS (`/proc/<pid>/status`) are polled, and it is `SIGKILL`ed on the
-  first violation. On Windows it runs in a Job Object, polled the same way via
-  `GetProcessTimes`, and peak memory is read back with `QueryInformationJobObject`. The
-  final figure comes from `wait4`'s `rusage` (Unix) so it is exact, not a sampled value.
-- **Wall-clock backstop.** No CPU limit can catch a program that blocks forever without
-  burning CPU — a deadlock on stdin, a `sleep`. Each program therefore also gets its CPU
-  limit + 10 s of wall clock; exceeding that is still `TLE`, reported as `idle too long`
-  to distinguish it from a genuine time limit exceeded. Compilation is the one thing
-  limited purely on wall clock (120 s).
-- **Ctrl-C** stops the run cleanly and reports how many tests had passed.
 
 ## Development
 
